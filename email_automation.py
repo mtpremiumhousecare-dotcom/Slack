@@ -289,12 +289,18 @@ def send_via_mailchimp(key: str) -> tuple:
         return False, f"Mailchimp error: {e}"
 
 
+def approve_email(key: str, personal_note: str = None) -> tuple:
+    """Approve an email: optionally add a personal note, then send via Mailchimp."""
+    if key not in _pending_emails:
+        return False, "Email not found in queue."
+    if personal_note:
+        add_personal_note(key, personal_note)
+    return send_via_mailchimp(key)
+
 def skip_email(key: str):
     """Mark an email as skipped."""
     if key in _pending_emails:
         _pending_emails[key]["status"] = "skipped"
-
-
 def get_email_prompt(email_type: str, customer_data: dict) -> str:
     """
     Get the AI prompt for drafting an email of a given type.
