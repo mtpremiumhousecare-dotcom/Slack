@@ -305,3 +305,48 @@ def get_ai_status() -> dict:
         "Morning briefs":       MODELS["fast"],
     }
     return {"models": status, "routing": routing}
+
+
+def ai_score_lead(lead_data: dict) -> dict:
+    """
+    Score a lead using AI based on fit, urgency, and revenue potential.
+    Returns a score (1-10), reasoning, and recommended action.
+    """
+    system = f"""You are a lead scoring analyst for {BUSINESS_NAME}, a premium cleaning company in Montana.
+Score leads from 1-10 based on:
+- Service fit (do we offer what they need?)
+- Revenue potential (recurring vs one-time, property size)
+- Urgency (how soon do they need service?)
+- Location (is it in our service area: {SERVICE_AREA}?)
+
+FORMAT YOUR RESPONSE AS:
+SCORE: [1-10]
+REASONING: [one sentence]
+ACTION: [one of: call_now, email_today, add_to_nurture, skip]
+"""
+    prompt = f"""Lead details:
+- Name: {lead_data.get('name', 'Unknown')}
+- Source: {lead_data.get('source', 'Unknown')}
+- Service requested: {lead_data.get('service', 'Unknown')}
+- Location: {lead_data.get('location', 'Unknown')}
+- Notes: {lead_data.get('notes', 'None')}
+
+Score this lead."""
+    result = _route_call("fast", system, prompt, temperature=0.3, max_tokens=200)
+    # Parse the response
+    score = 5
+    reasoning = result
+    action = "email_today"
+    try:
+        for line in result.split("\n"):
+            line = line.strip()
+            if line.startswith("SCORE:"):
+                score = int("".join(c for c in line.replace("SCORE:", "").strip() if c.isdigit())[:2])
+                score = max(1, min(10, score))
+            elif line.startswith("REASONING:"):
+                reasoning = line.replace("REASONING:", "").strip()
+            elif line.startswith("ACTION:"):
+                action = line.replace("ACTION:", "").strip().lower()
+    except Exception:
+        pass
+    return {"score": score, "reasoning": reasoning, "action": action}
