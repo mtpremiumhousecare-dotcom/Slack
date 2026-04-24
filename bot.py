@@ -88,6 +88,19 @@ from employee_profitability import (
     build_profitability_report, format_profitability_for_slack,
     set_pay_rate, get_pay_rate, get_all_pay_rates,
 )
+from proactive_scheduler import (
+    start_proactive_scheduler, get_scheduler_status,
+    run_morning_brief, run_eod_summary, run_email_drafts,
+)
+from email_automation import (
+    queue_email, approve_email as ea_approve_email, skip_email as ea_skip_email,
+    get_email_stats, send_via_mailchimp, get_email_prompt,
+)
+from bot_memory import (
+    learn as mem_learn, forget as mem_forget, recall as mem_recall,
+    get_context_for_ai, get_customer_context, should_skip_alert,
+    get_memory_stats, format_memories_for_slack, CATEGORIES as MEM_CATEGORIES,
+)
 
 # ── In-memory stores ─────────────────────────────────────────────────────────
 jobs      = {}
@@ -443,7 +456,10 @@ def hcp_cmd(ack, respond, command):
         if not job_list_hcp:
             respond(f"No jobs found with status: `{status}`")
             return
-        lines = [f"• *{j.get('customer',{}).get('first_name','')} {j.get('customer',{}).get('last_name','')}*\n  🏷 {j.get('job_type',{}).get('name','?')} | 📅 {j.get('schedule',{}).get('scheduled_start','?')[:10]} | Status: {j.get('work_status','?')}" for j in job_list_hcp[:15]]
+        def _sched_date(j):
+            s = (j.get('schedule') or {}).get('scheduled_start')
+            return s[:10] if s else '?'
+        lines = [f"• *{j.get('customer',{}).get('first_name','')} {j.get('customer',{}).get('last_name','')}*\n  🏷 {j.get('job_type',{}).get('name','?')} | 📅 {_sched_date(j)} | Status: {j.get('work_status','?')}" for j in job_list_hcp[:15]]
         respond(f"*📋 HousecallPro Jobs — {status.title()} ({len(job_list_hcp)} found):*\n\n" + "\n\n".join(lines))
 
     # ── /hcp customers [search] ──
@@ -736,7 +752,7 @@ def office_cmd(ack, respond, command):
             all_j = jobs_data.get("jobs", [])
             hcp_summary["needs_invoice"] = [j for j in all_j if j.get("invoice_status") == "uninvoiced" and j.get("work_status") == "completed"]
             hcp_summary["cancelled"] = [j for j in all_j if j.get("work_status") == "cancelled"]
-            hcp_summary["scheduled_today"] = [j for j in all_j if j.get("schedule", {}).get("scheduled_start", "")[:10] == datetime.date.today().isoformat()]
+            hcp_summary["scheduled_today"] = [j for j in all_j if (j.get("schedule") or {}).get("scheduled_start") and j["schedule"]["scheduled_start"][:10] == datetime.date.today().isoformat()]
         est_data, est_err = hcp_get("/estimates", params={"page_size": 100})
         if not est_err:
             hcp_summary["unconverted_estimates"] = [e for e in est_data.get("estimates", []) if e.get("status") not in ("approved", "converted_to_job")]
@@ -1010,6 +1026,33 @@ def office_cmd(ack, respond, command):
             f"*HousecallPro:* {'✅ Connected' if HCP_API_KEY and HCP_API_KEY != 'your_housecallpro_api_key_here' else '⚠️ Not configured'}"
         )
 
+    # ── /office emails — View email queue stats ──
+    elif sub == "emails":
+        stats = get_email_stats()
+        respond(
+            f"*Email Queue Status:*\n\n"
+            f"  Pending review: *{stats['pending']}*\n"
+            f"  Sent: *{stats['sent']}*\n"
+            f"  Skipped: *{stats['skipped']}*\n\n"
+            f"_Emails are auto-drafted on Mondays (win-backs) and Wednesdays (cold leads)._\n"
+            f"_Review and approve them in #carolyn._"
+        )
+
+    # ── /office scheduler — View scheduler status ──
+    elif sub == "scheduler":
+        s = get_scheduler_status()
+        respond(
+            f"*Proactive Scheduler Status:*\n\n"
+            f"  Running: {'✅ Yes' if s['running'] else '❌ No'}\n"
+            f"  Morning Brief: *{s['morning_brief_time']}* daily\n"
+            f"  EOD Summary: *{s['eod_summary_time']}* daily\n"
+            f"  Friday Report: *{s['friday_report_time']}* Fridays\n"
+            f"  Carolyn Phone: {s['carolyn_phone']}\n"
+            f"  Twilio: {'✅ Configured' if s['twilio_configured'] else '⚠️ Not configured'}\n"
+            f"  Tasks sent today: {len(s['tasks_sent_today'])}\n\n"
+            f"_The bot automatically texts Carolyn briefs, drafts emails, and posts reports._"
+        )
+
     else:
         respond(
             "*🏢 /office — Carolyn's Command Center*\n\n"
@@ -1021,6 +1064,8 @@ def office_cmd(ack, respond, command):
             "`/office reply sms|hcp [id] [message]` — Quick reply to texts or HCP messages\n"
             "`/office profit [last]` — Employee profitability report (this week or last)\n"
             "`/office payrate [name] [rate]` — View/set hourly pay rates\n"
+            "`/office emails` — Email queue status\n"
+            "`/office scheduler` — Proactive scheduler status\n"
             "`/office status` — System status overview"
         )
 
@@ -1078,6 +1123,52 @@ def carolyn_cmd(ack, respond, command):
         else:
             respond(f"⚠️ Unknown preference key: `{key}`")
 
+    # ── /carolyn learn [category] [content] ──
+    elif sub == "learn":
+        parts = rest.strip().split(None, 1)
+        if len(parts) < 2:
+            cat_list = "\n".join([f"  `{k}` — {v}" for k, v in MEM_CATEGORIES.items()])
+            respond(f"Usage: `/carolyn learn [category] [what to remember]`\n\nCategories:\n{cat_list}\n\nExamples:\n  `/carolyn learn preferences I like emails to be short and warm`\n  `/carolyn learn dont_do Stop sending alerts about unconfirmed jobs`\n  `/carolyn learn customer_notes Mrs. Henderson prefers Friday mornings`\n  `/carolyn learn email_style Never use the word 'valued' in emails`")
+            return
+        category, content = parts[0].lower(), parts[1]
+        entry = mem_learn(category, content)
+        if "error" in entry:
+            respond(f"\u26a0\ufe0f {entry['error']}")
+        else:
+            respond(f"\u2705 Got it! I'll remember that.\n\n*Category:* {category}\n*Memory #{entry['id']}:* _{content}_\n\n_I'll apply this to everything I do from now on. To undo: `/carolyn forget {entry['id']}`_")
+
+    # ── /carolyn forget [id or keyword] ──
+    elif sub == "forget":
+        identifier = rest.strip()
+        if not identifier:
+            respond("Usage: `/carolyn forget [memory # or keyword]`\nExample: `/carolyn forget 3` or `/carolyn forget alerts`")
+            return
+        result = mem_forget(identifier)
+        if result["forgotten"] > 0:
+            names = ", ".join([f"#{m['id']}" for m in result["items"]])
+            respond(f"\u2705 Forgotten {result['forgotten']} memory(s): {names}\n\n_I won't apply these anymore._")
+        else:
+            respond(f"\u26a0\ufe0f No active memories matching '{identifier}'. Use `/carolyn memory all` to see what I know.")
+
+    # ── /carolyn memory [category or 'all'] ──
+    elif sub == "memory":
+        category = rest.strip().lower() if rest.strip() else "all"
+        if category == "stats":
+            stats = get_memory_stats()
+            cat_breakdown = "\n".join([f"  {k}: *{v}*" for k, v in stats['by_category'].items()]) if stats['by_category'] else "  _None yet_"
+            respond(
+                f"*Bot Memory Stats:*\n\n"
+                f"  Active memories: *{stats['total_active']}*\n"
+                f"  Total learned: *{stats['total_learned']}*\n"
+                f"  Total forgotten: *{stats['total_forgotten']}*\n"
+                f"  Last updated: {stats['last_updated'][:16]}\n\n"
+                f"*By Category:*\n{cat_breakdown}"
+            )
+        else:
+            memories = mem_recall(category=category if category != "all" else None)
+            formatted = format_memories_for_slack(memories)
+            respond(f"*What I Know{f' ({category})' if category != 'all' else ''}:*\n{formatted}")
+
     # ── /carolyn mood [mood] [note] ──
     elif sub == "mood":
         parts = rest.strip().split(None, 1)
@@ -1098,12 +1189,15 @@ def carolyn_cmd(ack, respond, command):
 
     else:
         respond(
-            "*👤 /carolyn — Carolyn's Profile & Wellness*\n\n"
-            "`/carolyn meet` — Start onboarding interview\n"
-            "`/carolyn answer [text]` — Answer interview question\n"
-            "`/carolyn profile` — View saved preferences\n"
-            "`/carolyn update [key] [value]` — Update a preference\n"
-            "`/carolyn mood [mood] [note]` — Daily mood check-in\n"
+            "*\ud83d\udc64 /carolyn \u2014 Carolyn's Profile, Memory & Wellness*\n\n"
+            "`/carolyn meet` \u2014 Start onboarding interview\n"
+            "`/carolyn answer [text]` \u2014 Answer interview question\n"
+            "`/carolyn profile` \u2014 View saved preferences\n"
+            "`/carolyn update [key] [value]` \u2014 Update a preference\n"
+            "`/carolyn learn [category] [text]` \u2014 Teach me something new\n"
+            "`/carolyn forget [# or keyword]` \u2014 Make me forget something\n"
+            "`/carolyn memory [category|all|stats]` \u2014 See what I know\n"
+            "`/carolyn mood [mood] [note]` \u2014 Daily mood check-in\n"
             "  Moods: `great` `good` `okay` `stressed` `tired` `frustrated` `excited`"
         )
 
@@ -1312,6 +1406,44 @@ def call_customer_action(ack, body, respond):
     phone = body["actions"][0]["value"]
     respond(f"📞 Call {phone} now.\n\nRemember: warmth first, listen actively, and say 'My pleasure!'\n\n_Use `/service script new_inquiry` for a phone script._")
 
+@app.action("approve_email")
+def approve_email_action(ack, body, respond):
+    ack()
+    try:
+        val = json.loads(body["actions"][0]["value"])
+        email_type = val.get("type", "")
+        name = val.get("name", "")
+        email = val.get("email", "")
+        # Extract personal note from the input block
+        personal_note = ""
+        state_values = body.get("state", {}).get("values", {})
+        for block_id, block_data in state_values.items():
+            if "personal_note_input" in block_data:
+                personal_note = block_data["personal_note_input"].get("value", "") or ""
+                break
+        key = f"{email_type}_{name}"
+        if personal_note:
+            queue_email(key, {"type": email_type, "name": name, "email": email, "personal_note": personal_note})
+        success, msg = send_via_mailchimp(key, email)
+        if success:
+            respond(f"✅ *Email sent to {name}* ({email})\n\n{f'Personal note added: _{personal_note}_' if personal_note else '_No personal note added_'}\n\n_Sent via Mailchimp_")
+        else:
+            respond(f"⚠️ Failed to send: {msg}\n\n_You can try again or send manually from mtpremiumhousecare@gmail.com_")
+    except Exception as e:
+        respond(f"⚠️ Error processing approval: {str(e)}")
+
+@app.action("skip_email")
+def skip_email_action(ack, body, respond):
+    ack()
+    name = body["actions"][0]["value"]
+    ea_skip_email(f"win_back_{name}")
+    ea_skip_email(f"follow_up_{name}")
+    respond(f"⏭️ Skipped email for {name}.")
+
+@app.action("personal_note_input")
+def personal_note_input_action(ack):
+    ack()
+
 @app.action("mark_sms_handled")
 def mark_sms_handled_action(ack, body, respond):
     ack()
@@ -1334,23 +1466,25 @@ def mark_hcp_handled_action(ack, body, respond):
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print(f"🧹 {BUSINESS_NAME} Slack Bot (v4 — Command Center) starting...")
+    print(f"🧹 {BUSINESS_NAME} Slack Bot (v5 — Full Automation) starting...")
     print(f"📍 Service areas: {SERVICE_AREA}")
     print(f"🔑 HousecallPro API: {'✅' if HCP_API_KEY and HCP_API_KEY != 'your_housecallpro_api_key_here' else '⚠️  Not configured'}")
-
     # Show AI status
     ai = get_ai_status()
     for model, status in ai["models"].items():
         print(f"🤖 {model}: {status}")
-
+    # Show memory status
+    mem_stats = get_memory_stats()
+    print(f"🧠 Bot Memory: {mem_stats['total_active']} active memories")
     # Start lead monitor polling in background (every 15 min)
     print("🔄 Starting lead monitor (polling every 15 min)...")
     start_polling(interval_seconds=900)
-
     # Start command center (smart alerts every 10 min, HCP messages every 5 min, EOD at 5pm)
     print("🧠 Starting Command Center (alerts, HCP messages, EOD summary)...")
     start_command_center()
-
+    # Start proactive scheduler (morning brief at 9:30am, EOD at 5pm, email drafts Mon/Wed/Fri)
+    print("📅 Starting Proactive Scheduler (morning brief 9:30am, emails Mon/Wed/Fri)...")
+    start_proactive_scheduler()
     # Start Twilio SMS webhook server (receives incoming texts)
     twilio_status = get_twilio_status()
     if twilio_status["configured"]:
@@ -1358,18 +1492,23 @@ if __name__ == "__main__":
         start_webhook_server(port=5050)
     else:
         print("📱 Twilio SMS: ⚠️  Not configured (add credentials to .env when ready)")
-
     print("")
     print("═" * 55)
-    print(f"  ⚡️ {BUSINESS_NAME} Bot v4 is LIVE")
+    print(f"  ⚡️ {BUSINESS_NAME} Bot v5 is LIVE")
     print(f"  👩 Carolyn's Command Center: ACTIVE")
     print(f"  📋 Unified Feed: ACTIVE")
     print(f"  🚨 Smart Alerts: ACTIVE (every 10 min)")
     print(f"  💬 HCP Messages: ACTIVE (every 5 min)")
     print(f"  📱 Twilio SMS: {'ACTIVE' if twilio_status['configured'] else 'WAITING FOR CONFIG'}")
+    print(f"  📅 Proactive Scheduler: ACTIVE")
+    print(f"     Morning Brief: 9:30 AM daily")
+    print(f"     EOD Summary: 5:00 PM daily")
+    print(f"     Email Drafts: Mon/Wed/Fri 10:00 AM")
+    print(f"     Weekly Report: Friday 4:00 PM")
+    print(f"  📧 Email Automation: ACTIVE (Mailchimp)")
+    print(f"  🧠 Bot Memory: {mem_stats['total_active']} memories loaded")
     print(f"  🌅 EOD Summary: ACTIVE (5:00 PM daily)")
     print("═" * 55)
     print("")
-
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()

@@ -475,6 +475,8 @@ _Have a great evening! 🧹_"""
 
 _monitor_active = False
 _last_eod_date = None  # Track if we've already posted EOD today
+_alerted_keys = {}  # Deduplication: {alert_key: timestamp}
+_ALERT_COOLDOWN = 3600  # Don't re-alert same item for 1 hour
 
 def _monitor_loop(alert_interval=600, message_interval=300):
     """
@@ -513,15 +515,24 @@ def _monitor_loop(alert_interval=600, message_interval=300):
                 print(f"  ⚠️ HCP message check error: {e}")
             last_message_check = now
 
-        # Check smart alerts every 10 minutes
+        # Check smart alerts every 10 minutes (with deduplication)
         if now - last_alert_check >= alert_interval:
             try:
                 alerts = check_smart_alerts()
+                new_alerts = []
                 for alert in alerts:
-                    _post_alert_to_slack(alert)
-                    log_event("alert", "Smart Alerts", alert["title"], alert["detail"], alert["icon"])
-                if alerts:
-                    print(f"  🚨 {len(alerts)} smart alert(s) posted")
+                    alert_key = f"{alert['type']}_{alert['title'][:50]}"
+                    last_alerted = _alerted_keys.get(alert_key, 0)
+                    if now - last_alerted >= _ALERT_COOLDOWN:
+                        _post_alert_to_slack(alert)
+                        log_event("alert", "Smart Alerts", alert["title"], alert["detail"], alert["icon"])
+                        _alerted_keys[alert_key] = now
+                        new_alerts.append(alert)
+                # Clean up old keys (older than 24 hours)
+                cutoff = now - 86400
+                _alerted_keys = {k: v for k, v in _alerted_keys.items() if v > cutoff}
+                if new_alerts:
+                    print(f"  🚨 {len(new_alerts)} new alert(s) ({len(alerts) - len(new_alerts)} suppressed)")
             except Exception as e:
                 print(f"  ⚠️ Smart alerts error: {e}")
             last_alert_check = now

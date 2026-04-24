@@ -23,6 +23,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── Bot Memory Integration ───────────────────────────────────────────────────
+# Import memory system so AI calls include learned preferences
+try:
+    from bot_memory import get_context_for_ai, get_customer_context
+    _memory_available = True
+except ImportError:
+    _memory_available = False
+    def get_context_for_ai(task_type=None): return ""
+    def get_customer_context(name): return ""
+
 # ── Model Configuration ──────────────────────────────────────────────────────
 
 # OpenAI-compatible client — requires OPENAI_API_KEY in .env
@@ -125,7 +135,12 @@ def _call_claude(system_prompt: str, user_prompt: str, temperature: float = 0.7,
 
 
 def _route_call(task_type: str, system_prompt: str, user_prompt: str, temperature: float = 0.7, max_tokens: int = 1500) -> str:
-    """Route to the best model based on task type."""
+    """Route to the best model based on task type. Injects learned memory context."""
+    # Inject Carolyn's learned preferences and corrections into every AI call
+    memory_context = get_context_for_ai(task_type=task_type)
+    if memory_context:
+        system_prompt = system_prompt + "\n\n--- LEARNED FROM CAROLYN (always apply these) ---\n" + memory_context + "\n--- END LEARNED CONTEXT ---"
+
     model = MODELS.get(task_type, "gpt-4.1-mini")
     if model == "claude":
         return _call_claude(system_prompt, user_prompt, temperature, max_tokens)

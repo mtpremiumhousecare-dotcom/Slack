@@ -107,7 +107,7 @@ def fetch_completed_jobs(start_date, end_date, page=1, all_jobs=None):
     # Filter by date range (scheduled_start)
     for job in jobs:
         sched = job.get("schedule", {})
-        start = sched.get("scheduled_start", "")[:10] if sched else ""
+        start = sched.get("scheduled_start", "")[:10] if sched and sched.get("scheduled_start") else ""
         if start and start_date.isoformat() <= start <= end_date.isoformat():
             all_jobs.append(job)
     # Paginate if needed
