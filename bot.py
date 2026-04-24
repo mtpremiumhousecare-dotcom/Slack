@@ -101,6 +101,8 @@ from bot_memory import (
     get_context_for_ai, get_customer_context, should_skip_alert,
     get_memory_stats, format_memories_for_slack, CATEGORIES as MEM_CATEGORIES,
 )
+from chat_handler import build_chat_response, detect_intent
+from ai_engine import _route_call as ai_route_call
 
 # ── In-memory stores ─────────────────────────────────────────────────────────
 jobs      = {}
@@ -1462,11 +1464,70 @@ def mark_hcp_handled_action(ack, body, respond):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# NATURAL LANGUAGE CHAT — @mentions and DMs
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _chat_ai_func(user_message: str, system_prompt: str) -> str:
+    """Wrapper around ai_route_call for chat_handler's ai_func parameter."""
+    return ai_route_call("reasoning", system_prompt, user_message, temperature=0.7, max_tokens=800)
+
+
+def _get_user_display_name(client, user_id: str) -> str:
+    """Look up a Slack user's display name."""
+    try:
+        info = client.users_info(user=user_id)
+        profile = info["user"]["profile"]
+        return profile.get("display_name") or profile.get("real_name") or "there"
+    except Exception:
+        return "there"
+
+
+@app.event("app_mention")
+def handle_app_mention(event, say, client):
+    """Respond when someone @mentions the bot in a channel."""
+    try:
+        raw_text = event.get("text", "")
+        # Strip the bot's @mention from the message
+        import re as _re
+        text = _re.sub(r"<@[A-Z0-9]+>", "", raw_text).strip()
+        if not text:
+            text = "hi"
+        user_id = event.get("user", "")
+        user_name = _get_user_display_name(client, user_id)
+        result = build_chat_response(text, user_name=user_name, ai_func=_chat_ai_func)
+        say(text=result["text"], thread_ts=event.get("ts"))
+    except Exception as e:
+        say(text=f"Sorry, I hit an error: {str(e)}", thread_ts=event.get("ts"))
+
+
+@app.event("message")
+def handle_dm(event, say, client):
+    """Respond to direct messages sent to the bot."""
+    # Only respond to DMs (channel type 'im'), ignore bot messages and edits
+    if event.get("channel_type") != "im":
+        return
+    if event.get("subtype") in ("bot_message", "message_changed", "message_deleted"):
+        return
+    if event.get("bot_id"):
+        return
+    try:
+        text = event.get("text", "").strip()
+        if not text:
+            return
+        user_id = event.get("user", "")
+        user_name = _get_user_display_name(client, user_id)
+        result = build_chat_response(text, user_name=user_name, ai_func=_chat_ai_func)
+        say(text=result["text"])
+    except Exception as e:
+        say(text=f"Sorry, I hit an error: {str(e)}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print(f"🧹 {BUSINESS_NAME} Slack Bot (v5 — Full Automation) starting...")
+    print(f"🧹 {BUSINESS_NAME} Slack Bot (v5.1 — Natural Language Chat) starting...")
     print(f"📍 Service areas: {SERVICE_AREA}")
     print(f"🔑 HousecallPro API: {'✅' if HCP_API_KEY and HCP_API_KEY != 'your_housecallpro_api_key_here' else '⚠️  Not configured'}")
     # Show AI status
@@ -1494,7 +1555,7 @@ if __name__ == "__main__":
         print("📱 Twilio SMS: ⚠️  Not configured (add credentials to .env when ready)")
     print("")
     print("═" * 55)
-    print(f"  ⚡️ {BUSINESS_NAME} Bot v5 is LIVE")
+    print(f"  ⚡️ {BUSINESS_NAME} Bot v5.1 is LIVE")
     print(f"  👩 Carolyn's Command Center: ACTIVE")
     print(f"  📋 Unified Feed: ACTIVE")
     print(f"  🚨 Smart Alerts: ACTIVE (every 10 min)")
@@ -1507,6 +1568,7 @@ if __name__ == "__main__":
     print(f"     Weekly Report: Friday 4:00 PM")
     print(f"  📧 Email Automation: ACTIVE (Mailchimp)")
     print(f"  🧠 Bot Memory: {mem_stats['total_active']} memories loaded")
+    print(f"  💬 Natural Language Chat: ACTIVE (@mentions + DMs)")
     print(f"  🌅 EOD Summary: ACTIVE (5:00 PM daily)")
     print("═" * 55)
     print("")
