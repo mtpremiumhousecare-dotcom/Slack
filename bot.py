@@ -32,6 +32,7 @@ import json
 import random
 import datetime
 import threading
+import time
 import requests
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -439,6 +440,63 @@ def customer_cmd(ack, respond, command):
 # COMMAND 4 — /hcp  (jobs | customers | leads | analysis)
 # ═════════════════════════════════════════════════════════════════════════════
 
+def build_hcp_analysis():
+    """Pull jobs/estimates/customers from HCP and build the analysis blocks.
+    Returns (text_summary, blocks). On error, blocks is None and text is the error message."""
+    jobs_data, err = hcp_get("/jobs", params={"page_size": 100})
+    if err:
+        return (f"⚠️ Could not fetch jobs: {err}\n\n_Make sure your HousecallPro API key is set in `.env`._", None)
+    all_jobs = jobs_data.get("jobs", [])
+    cancelled = [j for j in all_jobs if j.get("work_status") == "cancelled"]
+    needs_invoice = [j for j in all_jobs if j.get("invoice_status") == "uninvoiced" and j.get("work_status") == "completed"]
+    est_data, est_err = hcp_get("/estimates", params={"page_size": 100})
+    unconverted_estimates = []
+    if not est_err:
+        unconverted_estimates = [e for e in est_data.get("estimates", []) if e.get("status") not in ("approved", "converted_to_job")]
+    cust_data, cust_err = hcp_get("/customers", params={"page_size": 100})
+    lapsed_customers = []
+    if not cust_err:
+        today_dt = datetime.date.today()
+        for c in cust_data.get("customers", []):
+            last_job = c.get("last_job_date") or c.get("updated_at", "")
+            if last_job:
+                try:
+                    last_dt = datetime.date.fromisoformat(last_job[:10])
+                    if (today_dt - last_dt).days > 60:
+                        lapsed_customers.append({"name": f"{c.get('first_name','')} {c.get('last_name','')}", "phone": c.get("mobile_number") or c.get("home_number","N/A"), "days_since": (today_dt - last_dt).days})
+                except Exception:
+                    pass
+    summary = (f"HCP Analysis — {len(all_jobs)} jobs, "
+               f"{len(cancelled)} cancelled, {len(needs_invoice)} uninvoiced, "
+               f"{len(unconverted_estimates)} open estimates, {len(lapsed_customers)} lapsed customers.")
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "📊 HousecallPro Business Analysis"}},
+        {"type": "divider"},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*Total Jobs:*\n{len(all_jobs)}"},
+            {"type": "mrkdwn", "text": f"*Cancelled:*\n🔴 {len(cancelled)}"},
+            {"type": "mrkdwn", "text": f"*Uninvoiced:*\n🟡 {len(needs_invoice)}"},
+            {"type": "mrkdwn", "text": f"*Open Estimates:*\n🟠 {len(unconverted_estimates)}"},
+            {"type": "mrkdwn", "text": f"*Lapsed (60+ days):*\n🔵 {len(lapsed_customers)}"},
+        ]},
+        {"type": "divider"},
+    ]
+    if cancelled:
+        lines = "\n".join([f"• {j.get('customer',{}).get('first_name','')} {j.get('customer',{}).get('last_name','')} — {j.get('job_type',{}).get('name','?')}" for j in cancelled[:8]])
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*🔴 Cancelled Jobs:*\n{lines}"}})
+    if unconverted_estimates:
+        lines = "\n".join([f"• {e.get('customer',{}).get('first_name','')} {e.get('customer',{}).get('last_name','')} — ${e.get('total_amount','?')} | {e.get('status','?')}" for e in unconverted_estimates[:8]])
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*🟠 Unconverted Estimates:*\n{lines}"}})
+    if lapsed_customers:
+        lines = "\n".join([f"• {c['name']} — 📞 {c['phone']} — {c['days_since']} days" for c in sorted(lapsed_customers, key=lambda x: x["days_since"], reverse=True)[:8]])
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*🔵 Lapsed Customers:*\n{lines}"}})
+    if needs_invoice:
+        lines = "\n".join([f"• {j.get('customer',{}).get('first_name','')} {j.get('customer',{}).get('last_name','')} — {j.get('job_type',{}).get('name','?')}" for j in needs_invoice[:8]])
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*🟡 Uninvoiced Jobs:*\n{lines}"}})
+    blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Analysis run {now_ts()} • {BUSINESS_NAME}_"}]})
+    return (summary, blocks)
+
+
 @app.command("/hcp")
 def hcp_cmd(ack, respond, command):
     ack()
@@ -497,56 +555,11 @@ def hcp_cmd(ack, respond, command):
     # ── /hcp analysis ──
     elif sub == "analysis":
         respond("⏳ Running HousecallPro analysis... this may take a moment.")
-        jobs_data, err = hcp_get("/jobs", params={"page_size": 100})
-        if err:
-            respond(f"⚠️ Could not fetch jobs: {err}\n\n_Make sure your HousecallPro API key is set in `.env`._")
-            return
-        all_jobs = jobs_data.get("jobs", [])
-        cancelled = [j for j in all_jobs if j.get("work_status") == "cancelled"]
-        needs_invoice = [j for j in all_jobs if j.get("invoice_status") == "uninvoiced" and j.get("work_status") == "completed"]
-        est_data, est_err = hcp_get("/estimates", params={"page_size": 100})
-        unconverted_estimates = []
-        if not est_err:
-            unconverted_estimates = [e for e in est_data.get("estimates", []) if e.get("status") not in ("approved", "converted_to_job")]
-        cust_data, cust_err = hcp_get("/customers", params={"page_size": 100})
-        lapsed_customers = []
-        if not cust_err:
-            today_dt = datetime.date.today()
-            for c in cust_data.get("customers", []):
-                last_job = c.get("last_job_date") or c.get("updated_at", "")
-                if last_job:
-                    try:
-                        last_dt = datetime.date.fromisoformat(last_job[:10])
-                        if (today_dt - last_dt).days > 60:
-                            lapsed_customers.append({"name": f"{c.get('first_name','')} {c.get('last_name','')}", "phone": c.get("mobile_number") or c.get("home_number","N/A"), "days_since": (today_dt - last_dt).days})
-                    except Exception:
-                        pass
-        blocks = [
-            {"type": "header", "text": {"type": "plain_text", "text": "📊 HousecallPro Business Analysis"}},
-            {"type": "divider"},
-            {"type": "section", "fields": [
-                {"type": "mrkdwn", "text": f"*Total Jobs:*\n{len(all_jobs)}"},
-                {"type": "mrkdwn", "text": f"*Cancelled:*\n🔴 {len(cancelled)}"},
-                {"type": "mrkdwn", "text": f"*Uninvoiced:*\n🟡 {len(needs_invoice)}"},
-                {"type": "mrkdwn", "text": f"*Open Estimates:*\n🟠 {len(unconverted_estimates)}"},
-                {"type": "mrkdwn", "text": f"*Lapsed (60+ days):*\n🔵 {len(lapsed_customers)}"},
-            ]},
-            {"type": "divider"},
-        ]
-        if cancelled:
-            lines = "\n".join([f"• {j.get('customer',{}).get('first_name','')} {j.get('customer',{}).get('last_name','')} — {j.get('job_type',{}).get('name','?')}" for j in cancelled[:8]])
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*🔴 Cancelled Jobs:*\n{lines}"}})
-        if unconverted_estimates:
-            lines = "\n".join([f"• {e.get('customer',{}).get('first_name','')} {e.get('customer',{}).get('last_name','')} — ${e.get('total_amount','?')} | {e.get('status','?')}" for e in unconverted_estimates[:8]])
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*🟠 Unconverted Estimates:*\n{lines}"}})
-        if lapsed_customers:
-            lines = "\n".join([f"• {c['name']} — 📞 {c['phone']} — {c['days_since']} days" for c in sorted(lapsed_customers, key=lambda x: x["days_since"], reverse=True)[:8]])
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*🔵 Lapsed Customers:*\n{lines}"}})
-        if needs_invoice:
-            lines = "\n".join([f"• {j.get('customer',{}).get('first_name','')} {j.get('customer',{}).get('last_name','')} — {j.get('job_type',{}).get('name','?')}" for j in needs_invoice[:8]])
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*🟡 Uninvoiced Jobs:*\n{lines}"}})
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Analysis run {now_ts()} • {BUSINESS_NAME}_"}]})
-        respond(blocks=blocks)
+        text, blocks = build_hcp_analysis()
+        if blocks:
+            respond(blocks=blocks, text=text)
+        else:
+            respond(text)
 
     else:
         respond(
@@ -1472,6 +1485,15 @@ def _chat_ai_func(user_message: str, system_prompt: str) -> str:
     return ai_route_call("reasoning", system_prompt, user_message, temperature=0.7, max_tokens=800)
 
 
+def _chat_runner(action_hint: str):
+    """Map a chat action_hint to the function that actually does the work.
+    Returns {"text": str, "blocks": list|None} or None if we don't know how to run it."""
+    if action_hint == "hcp_analysis":
+        text, blocks = build_hcp_analysis()
+        return {"text": text, "blocks": blocks}
+    return None
+
+
 def _get_user_display_name(client, user_id: str) -> str:
     """Look up a Slack user's display name."""
     try:
@@ -1482,9 +1504,34 @@ def _get_user_display_name(client, user_id: str) -> str:
         return "there"
 
 
+# Dedup recently-handled events. Slack can redeliver an event if the handler
+# is slow (e.g. an AI call takes >3s), which caused the duplicate replies
+# Carolyn was seeing.
+_HANDLED_EVENTS = {}
+_HANDLED_TTL_SEC = 60
+
+
+def _already_handled(event) -> bool:
+    key = event.get("client_msg_id") or event.get("event_ts") or event.get("ts")
+    if not key:
+        return False
+    now = time.time()
+    # prune old entries opportunistically
+    if len(_HANDLED_EVENTS) > 500:
+        for k, t in list(_HANDLED_EVENTS.items()):
+            if now - t > _HANDLED_TTL_SEC:
+                _HANDLED_EVENTS.pop(k, None)
+    if key in _HANDLED_EVENTS and now - _HANDLED_EVENTS[key] < _HANDLED_TTL_SEC:
+        return True
+    _HANDLED_EVENTS[key] = now
+    return False
+
+
 @app.event("app_mention")
 def handle_app_mention(event, say, client):
     """Respond when someone @mentions the bot in a channel."""
+    if _already_handled(event):
+        return
     try:
         raw_text = event.get("text", "")
         # Strip the bot's @mention from the message
@@ -1494,8 +1541,9 @@ def handle_app_mention(event, say, client):
             text = "hi"
         user_id = event.get("user", "")
         user_name = _get_user_display_name(client, user_id)
-        result = build_chat_response(text, user_name=user_name, ai_func=_chat_ai_func)
-        say(text=result["text"], thread_ts=event.get("ts"))
+        result = build_chat_response(text, user_name=user_name, ai_func=_chat_ai_func,
+                                      user_id=user_id, runner_func=_chat_runner)
+        say(text=result["text"], blocks=result.get("blocks"), thread_ts=event.get("ts"))
     except Exception as e:
         say(text=f"Sorry, I hit an error: {str(e)}", thread_ts=event.get("ts"))
 
@@ -1510,14 +1558,17 @@ def handle_dm(event, say, client):
         return
     if event.get("bot_id"):
         return
+    if _already_handled(event):
+        return
     try:
         text = event.get("text", "").strip()
         if not text:
             return
         user_id = event.get("user", "")
         user_name = _get_user_display_name(client, user_id)
-        result = build_chat_response(text, user_name=user_name, ai_func=_chat_ai_func)
-        say(text=result["text"])
+        result = build_chat_response(text, user_name=user_name, ai_func=_chat_ai_func,
+                                      user_id=user_id, runner_func=_chat_runner)
+        say(text=result["text"], blocks=result.get("blocks"))
     except Exception as e:
         say(text=f"Sorry, I hit an error: {str(e)}")
 

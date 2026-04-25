@@ -3,7 +3,36 @@ chat_handler.py — Natural Language Chat for Montana Premium House Care Bot
 Allows Carolyn (and Chris) to talk to the bot like a person instead of only slash commands.
 Uses AI to detect intent and route to the right action or have a conversation.
 """
-import os, re, json
+import os, re, json, time
+
+# Per-user pending action state. user_id -> (action_hint, set_at_epoch).
+# Lets the bot answer "yes" to a follow-up question like "Want me to run the full analysis?"
+_PENDING_ACTIONS = {}
+_PENDING_TTL_SEC = 300  # 5 minutes
+
+AFFIRMATIVE_RE = re.compile(
+    r"^\s*(yes+|yeah+|yep+|yup+|sure|please( do)?|do it|go ahead|run it|ok(ay)?|sounds good|absolutely|of course)\b[\s.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def is_affirmative(text: str) -> bool:
+    return bool(AFFIRMATIVE_RE.match(text or ""))
+
+
+def set_pending_action(user_id: str, action_hint: str) -> None:
+    if user_id and action_hint:
+        _PENDING_ACTIONS[user_id] = (action_hint, time.time())
+
+
+def pop_pending_action(user_id: str):
+    rec = _PENDING_ACTIONS.pop(user_id, None)
+    if not rec:
+        return None
+    action, ts = rec
+    if time.time() - ts > _PENDING_TTL_SEC:
+        return None
+    return action
 
 # ── Intent Detection ──────────────────────────────────────────────────────────
 # Maps natural language patterns to bot actions
@@ -78,11 +107,38 @@ def detect_intent(message: str) -> tuple:
     return "general_chat", None
 
 
-def build_chat_response(message: str, user_name: str = "there", ai_func=None) -> dict:
+def _run_action(action_hint: str, runner_func, user_name: str) -> dict:
+    """Execute a runner-backed action. Returns response dict or None on failure."""
+    if not runner_func or not action_hint:
+        return None
+    try:
+        result = runner_func(action_hint)
+    except Exception as e:
+        return {"text": f"⚠️ I tried to run that but hit an error: {e}", "blocks": None, "action_hint": None}
+    if not result:
+        return None
+    text = result.get("text") or f"Done, {user_name}."
+    return {"text": text, "blocks": result.get("blocks"), "action_hint": None}
+
+
+def build_chat_response(message: str, user_name: str = "there", ai_func=None,
+                        user_id: str = "", runner_func=None) -> dict:
     """
     Process a natural language message and return a response with optional action suggestions.
     Returns: {"text": str, "blocks": list or None, "action_hint": str or None}
+
+    runner_func, if provided, is called as runner_func(action_hint) and should return
+    {"text": str, "blocks": list|None} or None. Used to actually execute actions
+    (like running the HCP analysis) instead of only suggesting slash commands.
     """
+    # ── Affirmative reply to a previously-offered action ──────────────────
+    if user_id and is_affirmative(message):
+        pending = pop_pending_action(user_id)
+        if pending:
+            ran = _run_action(pending, runner_func, user_name)
+            if ran:
+                return ran
+
     intent, detail = detect_intent(message)
 
     # ── Greetings ─────────────────────────────────────────────────────────
@@ -201,7 +257,17 @@ What would you like to start with?"""
     }
 
     if intent in INTENT_COMMANDS:
+        # When the user explicitly asks for HCP analysis, just run it — don't
+        # make them retype `/hcp analysis`. This is the whole point of chat.
+        if intent == "hcp_analysis" and runner_func:
+            ran = _run_action("hcp_analysis", runner_func, user_name)
+            if ran:
+                return ran
+
         cmd = INTENT_COMMANDS[intent]
+        # Remember that we offered this action so a "yes" reply can execute it.
+        if user_id and cmd.get("action_hint"):
+            set_pending_action(user_id, cmd["action_hint"])
         return {"text": cmd["text"], "blocks": None, "action_hint": cmd.get("action_hint")}
 
     # ── General chat — use AI to respond ──────────────────────────────────
