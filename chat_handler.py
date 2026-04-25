@@ -270,7 +270,14 @@ What would you like to start with?"""
         # retype the slash command.
         AUTO_RUN_INTENTS = {"hcp_analysis", "lost_customers_csv"}
         if intent in AUTO_RUN_INTENTS and runner_func:
-            ran = _run_action(intent, runner_func, user_name)
+            action = intent
+            # For lost-customers, let the user say "90+ days" / "inactive 120 days"
+            # and pass that threshold through to the runner as "lost_customers_csv:90".
+            if intent == "lost_customers_csv":
+                m = re.search(r"(\d{2,4})\s*\+?\s*(?:day|d\b)", message.lower())
+                if m:
+                    action = f"lost_customers_csv:{int(m.group(1))}"
+            ran = _run_action(action, runner_func, user_name)
             if ran:
                 return ran
 

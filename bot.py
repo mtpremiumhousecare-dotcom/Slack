@@ -1578,19 +1578,26 @@ def _chat_runner(action_hint: str):
     if action_hint == "hcp_analysis":
         text, blocks = build_hcp_analysis()
         return {"text": text, "blocks": blocks}
-    if action_hint == "lost_customers_csv":
-        csv_text, result = build_lapsed_customers_csv(60)
+    if action_hint.startswith("lost_customers_csv"):
+        # action_hint format: "lost_customers_csv" or "lost_customers_csv:90"
+        threshold = 60
+        if ":" in action_hint:
+            try:
+                threshold = max(1, int(action_hint.split(":", 1)[1]))
+            except ValueError:
+                pass
+        csv_text, result = build_lapsed_customers_csv(threshold)
         if csv_text is None:
             return {"text": f"⚠️ Could not pull customers: {result}"}
         count = result
         if count == 0:
-            return {"text": "✅ No customers inactive 60+ days. Pipeline looks healthy."}
+            return {"text": f"✅ No customers inactive {threshold}+ days. Pipeline looks healthy."}
         return {
-            "text": f"📎 Full lost-customer report — {count} customers inactive 60+ days. See attached CSV.",
+            "text": f"📎 Full lost-customer report — {count} customers inactive {threshold}+ days. See attached CSV.",
             "file": {
                 "content": csv_text,
-                "filename": f"lost_customers_60d_{datetime.date.today().isoformat()}.csv",
-                "title": "Lost Customers (60+ days inactive)",
+                "filename": f"lost_customers_{threshold}d_{datetime.date.today().isoformat()}.csv",
+                "title": f"Lost Customers ({threshold}+ days inactive)",
             },
         }
     return None
