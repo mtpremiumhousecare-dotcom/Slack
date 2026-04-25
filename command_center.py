@@ -485,7 +485,7 @@ def _monitor_loop(alert_interval=600, message_interval=300):
       - HCP message check every 5 minutes
       - EOD summary at 5pm local time
     """
-    global _monitor_active, _last_eod_date
+    global _monitor_active, _last_eod_date, _alerted_keys
     _monitor_active = True
     last_alert_check = 0
     last_message_check = 0
