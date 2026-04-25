@@ -41,6 +41,11 @@ INTENT_PATTERNS = [
     (r"(find|get|search|look for|pull)\s+(leads?|prospects?|contacts?)", "find_leads"),
     (r"(leads?\s+(for|in))", "find_leads"),
     (r"(residential|commercial|airbnb|hotel|post.?construction)\s+(leads?|prospects?)", "find_leads"),
+    # Lost-customer CSV export — match BEFORE generic hcp_analysis so phrases like
+    # "list of all lost customers" or "full lapsed customer report" trigger the file
+    # upload rather than the summary card.
+    (r"(list|all|full|export|report|csv|spreadsheet|send me)\b.*?(lost|lapsed|inactive)\s+(customers?|clients?)", "lost_customers_csv"),
+    (r"(lost|lapsed|inactive)\s+(customers?|clients?)\b.*?(list|report|csv|export|spreadsheet|full|pdf)", "lost_customers_csv"),
     # HCP analysis
     (r"(analyze|analysis|check|review)\s+(hcp|housecall|house\s*call)", "hcp_analysis"),
     (r"(missed leads?|lost customers?|revenue gaps?|lapsed)", "hcp_analysis"),
@@ -182,6 +187,10 @@ What would you like to start with?"""
             "text": "I'll pull a full analysis from HousecallPro right now. Use:\n\n`/hcp analysis` — Full gap analysis (missed leads, lost customers, revenue gaps)\n`/hcp jobs` — Current jobs\n`/hcp customers` — Customer list\n`/hcp leads` — Pipeline leads\n\nWant me to run the full analysis?",
             "action_hint": "hcp_analysis",
         },
+        "lost_customers_csv": {
+            "text": "I'll pull every lost customer (60+ days inactive) and post a CSV you can open in Excel or Sheets.\n\n`/hcp lost` — Default 60+ days\n`/hcp lost 90` — 90+ days\n\nGenerating the report now...",
+            "action_hint": "lost_customers_csv",
+        },
         "morning_brief": {
             "text": "Here's how to get your morning brief:\n\n`/office brief` — Get today's brief right now\n\nI also send it automatically every day at 9:30 AM. Want me to pull it up now?",
             "action_hint": "morning_brief",
@@ -257,10 +266,11 @@ What would you like to start with?"""
     }
 
     if intent in INTENT_COMMANDS:
-        # When the user explicitly asks for HCP analysis, just run it — don't
-        # make them retype `/hcp analysis`. This is the whole point of chat.
-        if intent == "hcp_analysis" and runner_func:
-            ran = _run_action("hcp_analysis", runner_func, user_name)
+        # Intents we can fully execute via the runner — don't make the user
+        # retype the slash command.
+        AUTO_RUN_INTENTS = {"hcp_analysis", "lost_customers_csv"}
+        if intent in AUTO_RUN_INTENTS and runner_func:
+            ran = _run_action(intent, runner_func, user_name)
             if ran:
                 return ran
 

@@ -28,6 +28,8 @@ Run:  python3 bot.py
 """
 
 import os
+import csv
+import io
 import json
 import random
 import datetime
@@ -497,6 +499,61 @@ def build_hcp_analysis():
     return (summary, blocks)
 
 
+def build_lapsed_customers_csv(days_threshold: int = 60):
+    """Pull every customer from HCP, filter to those inactive >= days_threshold,
+    and return (csv_text, count). On error returns (None, error_message)."""
+    today_dt = datetime.date.today()
+    rows = []
+    page = 1
+    while True:
+        data, err = hcp_get("/customers", params={"page_size": 200, "page": page})
+        if err:
+            return (None, err)
+        batch = data.get("customers", [])
+        if not batch:
+            break
+        for c in batch:
+            last_job = c.get("last_job_date") or c.get("updated_at", "")
+            if not last_job:
+                continue
+            try:
+                last_dt = datetime.date.fromisoformat(last_job[:10])
+            except Exception:
+                continue
+            days = (today_dt - last_dt).days
+            if days < days_threshold:
+                continue
+            rows.append({
+                "name": f"{c.get('first_name','').strip()} {c.get('last_name','').strip()}".strip(),
+                "phone": c.get("mobile_number") or c.get("home_number") or "",
+                "email": c.get("email", ""),
+                "last_job_date": last_job[:10],
+                "days_since_last_job": days,
+                "address": ", ".join(filter(None, [
+                    (c.get("addresses") or [{}])[0].get("street", "") if c.get("addresses") else "",
+                    (c.get("addresses") or [{}])[0].get("city", "") if c.get("addresses") else "",
+                    (c.get("addresses") or [{}])[0].get("state", "") if c.get("addresses") else "",
+                ])),
+                "tags": ", ".join(c.get("tags", []) or []),
+                "hcp_customer_id": c.get("id", ""),
+            })
+        # Stop when we get a partial page (last page).
+        if len(batch) < 200:
+            break
+        page += 1
+        if page > 50:  # hard safety stop
+            break
+    rows.sort(key=lambda r: r["days_since_last_job"], reverse=True)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=[
+        "name", "phone", "email", "last_job_date", "days_since_last_job",
+        "address", "tags", "hcp_customer_id",
+    ])
+    writer.writeheader()
+    writer.writerows(rows)
+    return (buf.getvalue(), len(rows))
+
+
 @app.command("/hcp")
 def hcp_cmd(ack, respond, command):
     ack()
@@ -561,13 +618,42 @@ def hcp_cmd(ack, respond, command):
         else:
             respond(text)
 
+    # ── /hcp lost — Full lapsed-customer CSV upload ──
+    elif sub in ("lost", "lapsed"):
+        # Optional day threshold: `/hcp lost 90`
+        try:
+            threshold = int(rest.strip()) if rest.strip() else 60
+        except ValueError:
+            threshold = 60
+        respond(f"⏳ Pulling all customers inactive {threshold}+ days... one moment.")
+        csv_text, result = build_lapsed_customers_csv(threshold)
+        if csv_text is None:
+            respond(f"⚠️ Could not pull customers: {result}")
+            return
+        count = result
+        if count == 0:
+            respond(f"✅ No customers inactive {threshold}+ days. Pipeline looks healthy.")
+            return
+        filename = f"lost_customers_{threshold}d_{datetime.date.today().isoformat()}.csv"
+        try:
+            app.client.files_upload_v2(
+                channel=command["channel_id"],
+                content=csv_text,
+                filename=filename,
+                title=f"Lost Customers ({threshold}+ days inactive)",
+                initial_comment=f"📎 *Full lost-customer report* — {count} customers inactive {threshold}+ days. Sorted by days since last job (longest first).",
+            )
+        except Exception as e:
+            respond(f"⚠️ Built the report ({count} customers) but couldn't upload: {e}")
+
     else:
         respond(
             "*📊 /hcp — HousecallPro Integration*\n\n"
             "`/hcp jobs [status]` — Pull jobs (scheduled, completed, cancelled, all)\n"
             "`/hcp customers [search]` — Search customers\n"
             "`/hcp leads` — View pipeline leads\n"
-            "`/hcp analysis` — Full gap analysis (missed leads, lost customers, revenue gaps)"
+            "`/hcp analysis` — Full gap analysis (missed leads, lost customers, revenue gaps)\n"
+            "`/hcp lost [days]` — Full lapsed-customer CSV (default 60 days)"
         )
 
 
@@ -1487,11 +1573,50 @@ def _chat_ai_func(user_message: str, system_prompt: str) -> str:
 
 def _chat_runner(action_hint: str):
     """Map a chat action_hint to the function that actually does the work.
-    Returns {"text": str, "blocks": list|None} or None if we don't know how to run it."""
+    Returns {"text": str, "blocks": list|None, "file": dict|None} or None.
+    A "file" dict has keys: content, filename, title."""
     if action_hint == "hcp_analysis":
         text, blocks = build_hcp_analysis()
         return {"text": text, "blocks": blocks}
+    if action_hint == "lost_customers_csv":
+        csv_text, result = build_lapsed_customers_csv(60)
+        if csv_text is None:
+            return {"text": f"⚠️ Could not pull customers: {result}"}
+        count = result
+        if count == 0:
+            return {"text": "✅ No customers inactive 60+ days. Pipeline looks healthy."}
+        return {
+            "text": f"📎 Full lost-customer report — {count} customers inactive 60+ days. See attached CSV.",
+            "file": {
+                "content": csv_text,
+                "filename": f"lost_customers_60d_{datetime.date.today().isoformat()}.csv",
+                "title": "Lost Customers (60+ days inactive)",
+            },
+        }
     return None
+
+
+def _post_chat_result(result, channel, say, thread_ts=None):
+    """Send a chat_handler result, uploading any file attachment to Slack."""
+    fi = result.get("file")
+    text = result.get("text") or ""
+    if fi and channel:
+        try:
+            app.client.files_upload_v2(
+                channel=channel,
+                content=fi["content"],
+                filename=fi["filename"],
+                title=fi.get("title"),
+                initial_comment=text,
+                thread_ts=thread_ts,
+            )
+            return
+        except Exception as e:
+            text = f"{text}\n\n⚠️ Couldn't upload the file: {e}"
+    if thread_ts:
+        say(text=text, blocks=result.get("blocks"), thread_ts=thread_ts)
+    else:
+        say(text=text, blocks=result.get("blocks"))
 
 
 def _get_user_display_name(client, user_id: str) -> str:
@@ -1543,7 +1668,7 @@ def handle_app_mention(event, say, client):
         user_name = _get_user_display_name(client, user_id)
         result = build_chat_response(text, user_name=user_name, ai_func=_chat_ai_func,
                                       user_id=user_id, runner_func=_chat_runner)
-        say(text=result["text"], blocks=result.get("blocks"), thread_ts=event.get("ts"))
+        _post_chat_result(result, event.get("channel"), say, thread_ts=event.get("ts"))
     except Exception as e:
         say(text=f"Sorry, I hit an error: {str(e)}", thread_ts=event.get("ts"))
 
@@ -1568,7 +1693,7 @@ def handle_dm(event, say, client):
         user_name = _get_user_display_name(client, user_id)
         result = build_chat_response(text, user_name=user_name, ai_func=_chat_ai_func,
                                       user_id=user_id, runner_func=_chat_runner)
-        say(text=result["text"], blocks=result.get("blocks"))
+        _post_chat_result(result, event.get("channel"), say)
     except Exception as e:
         say(text=f"Sorry, I hit an error: {str(e)}")
 
