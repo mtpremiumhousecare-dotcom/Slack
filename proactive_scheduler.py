@@ -20,11 +20,14 @@ import json
 import requests
 from dotenv import load_dotenv
 
+from email_automation import queue_email
+
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SLACK_BOT_TOKEN     = os.getenv("SLACK_BOT_TOKEN", "")
 CAROLYN_CHANNEL     = os.getenv("SLACK_CAROLYN_CHANNEL", "#carolyn")
+CAROLYN_SLACK_ID    = os.getenv("CAROLYN_SLACK_ID", "")  # Carolyn's Slack user ID — DMs go here when set
 CAROLYN_PHONE       = os.getenv("CAROLYN_PHONE", "")  # Carolyn's number to text
 BUSINESS_PHONE      = os.getenv("BUSINESS_PHONE", "406-599-2699")
 TWILIO_ACCOUNT_SID  = os.getenv("TWILIO_ACCOUNT_SID", "")
@@ -33,6 +36,7 @@ TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
 MORNING_BRIEF_TIME  = os.getenv("MORNING_BRIEF_TIME", "09:30")  # 24h format, MT
 EOD_SUMMARY_TIME    = os.getenv("EOD_SUMMARY_TIME", "17:00")
 FRIDAY_REPORT_TIME  = os.getenv("FRIDAY_REPORT_TIME", "16:00")
+SUNDAY_RECO_TIME    = os.getenv("SUNDAY_RECO_TIME", "18:00")  # Sunday weekly proactive reco
 
 # Track what we've already sent today to avoid duplicates
 _sent_today = {}
@@ -95,6 +99,47 @@ def _post_to_slack(channel: str, text: str, blocks: list = None):
         )
     except Exception:
         pass
+
+
+def _carolyn_target() -> str:
+    """Where to deliver Carolyn-targeted messages. Prefer DM if her Slack ID is set."""
+    return CAROLYN_SLACK_ID or CAROLYN_CHANNEL
+
+
+def _post_draft_for_review(email_type: str, customer: dict, ai_body: str, ai_subject: str = None,
+                           context_line: str = "") -> str:
+    """Queue a draft email and post the review card to Carolyn.
+    Returns the queue key Carolyn's Approve button will reference."""
+    name = customer.get("name", "Customer")
+    email = customer.get("email", "")
+    customer_data = {"name": name, "email": email}
+    # email_automation.queue_email returns the key it stored under and computes
+    # the subject from the template if we don't pass one.
+    key = queue_email(email_type, customer_data, ai_body, subject=ai_subject)
+
+    safe_block_id = f"personal_note_{key}"
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": f"Draft: {email_type.replace('_',' ').title()} — {name}"}},
+    ]
+    if context_line:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"_{context_line}_"}]})
+    blocks.extend([
+        {"type": "section", "text": {"type": "mrkdwn", "text": (ai_body or "")[:2900]}},
+        {"type": "input", "block_id": safe_block_id, "optional": True, "element": {
+            "type": "plain_text_input",
+            "action_id": "personal_note_input",
+            "placeholder": {"type": "plain_text", "text": "Add a personal sentence (e.g. 'Hope the kids loved the snow last weekend!')"},
+            "multiline": True,
+        }, "label": {"type": "plain_text", "text": "Your personal note (optional — woven into the email)"}},
+        {"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "✅ Approve & Send"}, "style": "primary",
+             "value": key, "action_id": "approve_email"},
+            {"type": "button", "text": {"type": "plain_text", "text": "⏭ Skip"},
+             "value": key, "action_id": "skip_email"},
+        ]},
+    ])
+    _post_to_slack(_carolyn_target(), f"Draft {email_type} for {name}", blocks=blocks)
+    return key
 
 
 # ── HCP Data Helpers ─────────────────────────────────────────────────────────
@@ -272,7 +317,7 @@ def run_morning_brief():
     _text_carolyn(brief_text)
 
     # Post to Slack with richer formatting
-    _post_to_slack(CAROLYN_CHANNEL, f"*Morning Brief — {datetime.date.today().strftime('%A, %B %d')}*\n\n{brief_text}")
+    _post_to_slack(_carolyn_target(), f"*Morning Brief — {datetime.date.today().strftime('%A, %B %d')}*\n\n{brief_text}")
     print(f"  ✅ Morning brief sent to Carolyn")
 
 
@@ -284,97 +329,67 @@ def run_eod_summary():
     eod_text = _build_eod_summary()
 
     _text_carolyn(eod_text)
-    _post_to_slack(CAROLYN_CHANNEL, f"*End of Day Summary — {datetime.date.today().strftime('%A, %B %d')}*\n\n{eod_text}")
+    _post_to_slack(_carolyn_target(), f"*End of Day Summary — {datetime.date.today().strftime('%A, %B %d')}*\n\n{eod_text}")
     print(f"  ✅ EOD summary sent to Carolyn")
 
 
-def run_email_drafts(ai_draft_func=None):
+def run_email_drafts(ai_draft_func=None) -> dict:
     """
     Generate win-back and cold lead email drafts for Carolyn's review.
     Called on Monday and Wednesday mornings.
 
-    ai_draft_func: a callable(draft_type, customer_name) that returns AI-drafted text.
-                   Passed in from bot.py to use the ai_engine.
+    ai_draft_func: a callable(draft_type, customer_data_dict) that returns
+                   a dict like {"subject": str, "body": str}.
+
+    Returns {"win_back": [keys...], "follow_up": [keys...]} so the caller (e.g.
+    the bundled morning brief) can mention how many drafts are awaiting review.
     """
     today = datetime.date.today()
     day_name = today.strftime("%A")
+    posted = {"win_back": [], "follow_up": []}
 
     # Monday: Lost customer win-backs
     if day_name == "Monday" and not _already_sent("monday_winbacks"):
         lost = _build_lost_customer_list()
-        if lost:
-            summary = f"I found {len(lost)} customers who haven't booked in 60+ days. I've drafted win-back emails for the top {min(len(lost), 10)}. Check #carolyn to review and approve.\n\nTop lapsed:"
-            for c in lost[:5]:
-                summary += f"\n  - {c['name']} ({c['days_since']} days, last: {c['last_job_date']})"
-
-            _text_carolyn(summary)
-            _post_to_slack(CAROLYN_CHANNEL, f"*Win-Back Email Drafts Ready*\n\n{summary}\n\nReply with `/ai draft win_back [Name]` to see each draft, or I'll post them below for your review.")
-
-            # Post individual drafts to Slack for review
-            if ai_draft_func:
-                for c in lost[:10]:
-                    try:
-                        draft = ai_draft_func("win_back", c["name"])
-                        blocks = [
-                            {"type": "header", "text": {"type": "plain_text", "text": f"Draft: Win-Back Email for {c['name']}"}},
-                            {"type": "context", "elements": [
-                                {"type": "mrkdwn", "text": f"_{c['days_since']} days since last booking | Last job: {c['last_job_date']} | Email: {c.get('email', 'N/A')}_"}
-                            ]},
-                            {"type": "section", "text": {"type": "mrkdwn", "text": draft[:2900]}},
-                            {"type": "input", "block_id": f"personal_note_{c['name'].replace(' ', '_')}", "element": {
-                                "type": "plain_text_input",
-                                "action_id": "personal_note_input",
-                                "placeholder": {"type": "plain_text", "text": "Add a personal note here (e.g., 'Hope the kids are doing well!')"},
-                                "multiline": False,
-                            }, "label": {"type": "plain_text", "text": "Your Personal Touch"}},
-                            {"type": "actions", "elements": [
-                                {"type": "button", "text": {"type": "plain_text", "text": "Approve & Send"}, "style": "primary", "value": json.dumps({"type": "win_back", "name": c["name"], "email": c.get("email", "")}), "action_id": "approve_email"},
-                                {"type": "button", "text": {"type": "plain_text", "text": "Skip"}, "value": c["name"], "action_id": "skip_email"},
-                            ]},
-                        ]
-                        _post_to_slack(CAROLYN_CHANNEL, f"Draft win-back for {c['name']}", blocks=blocks)
-                    except Exception as e:
-                        print(f"  ⚠️  Failed to draft email for {c['name']}: {e}")
-
-            print(f"  ✅ Monday win-back drafts posted for Carolyn")
+        if lost and ai_draft_func:
+            for c in lost[:10]:
+                try:
+                    draft = ai_draft_func("winback", {
+                        "name": c["name"], "email": c.get("email", ""),
+                        "days_lapsed": c["days_since"], "last_job_date": c["last_job_date"],
+                    })
+                    body = draft.get("body", "") if isinstance(draft, dict) else str(draft)
+                    subject = draft.get("subject") if isinstance(draft, dict) else None
+                    context = f"{c['days_since']} days since last booking | Last job: {c['last_job_date']} | Email: {c.get('email', 'N/A')}"
+                    key = _post_draft_for_review("win_back", {"name": c["name"], "email": c.get("email", "")},
+                                                  body, ai_subject=subject, context_line=context)
+                    posted["win_back"].append(key)
+                except Exception as e:
+                    print(f"  ⚠️  Failed to draft email for {c['name']}: {e}")
+            if posted["win_back"]:
+                print(f"  ✅ Posted {len(posted['win_back'])} Monday win-back drafts for Carolyn")
 
     # Wednesday: Cold lead follow-ups
     if day_name == "Wednesday" and not _already_sent("wednesday_coldleads"):
         cold = _build_cold_lead_list()
-        if cold:
-            summary = f"I found {len(cold)} unconverted estimates (cold leads). I've drafted follow-up emails for the top {min(len(cold), 10)}. Check #carolyn to review.\n\nTop cold leads:"
-            for c in cold[:5]:
-                summary += f"\n  - {c['name']} (Est: ${c['estimate_total']}, sent: {c['created_at']})"
-
-            _text_carolyn(summary)
-            _post_to_slack(CAROLYN_CHANNEL, f"*Cold Lead Follow-Up Drafts Ready*\n\n{summary}")
-
-            if ai_draft_func:
-                for c in cold[:10]:
-                    try:
-                        draft = ai_draft_func("follow_up", c["name"])
-                        blocks = [
-                            {"type": "header", "text": {"type": "plain_text", "text": f"Draft: Follow-Up for {c['name']}"}},
-                            {"type": "context", "elements": [
-                                {"type": "mrkdwn", "text": f"_Estimate: ${c['estimate_total']} | Sent: {c['created_at']} | Status: {c['status']}_"}
-                            ]},
-                            {"type": "section", "text": {"type": "mrkdwn", "text": draft[:2900]}},
-                            {"type": "input", "block_id": f"personal_note_{c['name'].replace(' ', '_')}", "element": {
-                                "type": "plain_text_input",
-                                "action_id": "personal_note_input",
-                                "placeholder": {"type": "plain_text", "text": "Add a personal note (e.g., 'We'd love to take care of your home!')"},
-                                "multiline": False,
-                            }, "label": {"type": "plain_text", "text": "Your Personal Touch"}},
-                            {"type": "actions", "elements": [
-                                {"type": "button", "text": {"type": "plain_text", "text": "Approve & Send"}, "style": "primary", "value": json.dumps({"type": "follow_up", "name": c["name"], "email": c.get("email", "")}), "action_id": "approve_email"},
-                                {"type": "button", "text": {"type": "plain_text", "text": "Skip"}, "value": c["name"], "action_id": "skip_email"},
-                            ]},
-                        ]
-                        _post_to_slack(CAROLYN_CHANNEL, f"Draft follow-up for {c['name']}", blocks=blocks)
-                    except Exception as e:
-                        print(f"  ⚠️  Failed to draft email for {c['name']}: {e}")
-
-            print(f"  ✅ Wednesday cold lead drafts posted for Carolyn")
+        if cold and ai_draft_func:
+            for c in cold[:10]:
+                try:
+                    draft = ai_draft_func("cold_lead", {
+                        "name": c["name"], "email": c.get("email", ""),
+                        "days_ago": "a few weeks", "estimate_total": c.get("estimate_total", "?"),
+                        "created_at": c.get("created_at", "recently"),
+                    })
+                    body = draft.get("body", "") if isinstance(draft, dict) else str(draft)
+                    subject = draft.get("subject") if isinstance(draft, dict) else None
+                    context = f"Estimate: ${c['estimate_total']} | Sent: {c['created_at']} | Status: {c['status']}"
+                    key = _post_draft_for_review("follow_up", {"name": c["name"], "email": c.get("email", "")},
+                                                  body, ai_subject=subject, context_line=context)
+                    posted["follow_up"].append(key)
+                except Exception as e:
+                    print(f"  ⚠️  Failed to draft email for {c['name']}: {e}")
+            if posted["follow_up"]:
+                print(f"  ✅ Posted {len(posted['follow_up'])} Wednesday cold-lead drafts for Carolyn")
 
     # Friday: Weekly profitability report
     if day_name == "Friday" and not _already_sent("friday_profit"):
@@ -401,20 +416,183 @@ def run_email_drafts(ai_draft_func=None):
                         text_summary += f"\n  {i}"
 
                 _text_carolyn(text_summary)
-                _post_to_slack(CAROLYN_CHANNEL, f"*Weekly Employee Profitability Report*\n\n{text_summary}")
+                _post_to_slack(_carolyn_target(), f"*Weekly Employee Profitability Report*\n\n{text_summary}")
                 print(f"  ✅ Friday profitability report sent to Carolyn")
         except Exception as e:
             print(f"  ⚠️  Failed to generate Friday report: {e}")
+
+    return posted
+
+
+# ── Bundled Morning Brief ────────────────────────────────────────────────────
+
+def run_bundled_morning_brief(ai_draft_func=None, priority_func=None) -> None:
+    """One delivery for Carolyn each morning: brief + top priorities + drafts.
+
+    priority_func: optional callable returning the same shape as bot.build_priority_list
+                   — a list of {priority, category, icon, title, detail, action}.
+    """
+    if _already_sent("bundled_morning_brief"):
+        return
+    print("  📋 Building bundled morning brief...")
+    brief_text = _build_morning_brief()
+
+    # Post drafts FIRST (so we can reference them by count in the brief).
+    drafts_posted = run_email_drafts(ai_draft_func=ai_draft_func)
+    n_winback = len(drafts_posted.get("win_back", []))
+    n_followup = len(drafts_posted.get("follow_up", []))
+
+    # Top priorities (if a priority builder was passed in from bot.py).
+    priority_block = ""
+    if priority_func:
+        try:
+            top = priority_func()[:3]
+            if top:
+                lines = [f"  {i+1}. {p['icon']} *[{p['category']}]* {p['title']} — _{p['detail']}_"
+                         for i, p in enumerate(top)]
+                priority_block = "\n\n*🎯 Top 3 priorities for today:*\n" + "\n".join(lines)
+        except Exception as e:
+            print(f"  ⚠️  Could not compute priorities: {e}")
+
+    drafts_block = ""
+    if n_winback or n_followup:
+        bits = []
+        if n_winback:
+            bits.append(f"{n_winback} win-back email{'s' if n_winback != 1 else ''}")
+        if n_followup:
+            bits.append(f"{n_followup} cold-lead follow-up{'s' if n_followup != 1 else ''}")
+        drafts_block = (f"\n\n*📬 I drafted {' and '.join(bits)} for you.* Each one is posted below "
+                        f"with a personal-note field — add a sentence in your voice, then hit *Approve & Send*. "
+                        f"Nothing goes out until you click approve.")
+
+    full_text = f"*Morning Brief — {datetime.date.today().strftime('%A, %B %d')}*\n\n{brief_text}{priority_block}{drafts_block}"
+    # Single delivery: one Slack post + one text.
+    _text_carolyn(brief_text + (drafts_block.replace("*", "") if drafts_block else ""))
+    _post_to_slack(_carolyn_target(), full_text)
+    print(f"  ✅ Bundled morning brief delivered to Carolyn")
+
+
+# ── Sunday Weekly Proactive Recommendation ───────────────────────────────────
+
+def _build_weekly_snapshot() -> dict:
+    """Pull the past week's HCP data so the AI can pick a focus area."""
+    today = datetime.date.today()
+    week_ago = today - datetime.timedelta(days=7)
+    snap = {
+        "completed_jobs": 0, "revenue_estimate": 0.0,
+        "new_leads": 0, "open_estimates": 0,
+        "lapsed_60": 0, "lapsed_90": 0,
+        "uninvoiced_completed": 0,
+    }
+    jobs_data, err = _hcp_get("/jobs", params={"page_size": 200})
+    if not err and jobs_data:
+        for j in jobs_data.get("jobs", []):
+            completed = (j.get("completed_at") or "")[:10]
+            if completed:
+                try:
+                    if datetime.date.fromisoformat(completed) >= week_ago:
+                        snap["completed_jobs"] += 1
+                        try:
+                            snap["revenue_estimate"] += float(j.get("total_amount", 0) or 0)
+                        except (ValueError, TypeError):
+                            pass
+                except ValueError:
+                    pass
+            if j.get("invoice_status") == "uninvoiced" and j.get("work_status") == "completed":
+                snap["uninvoiced_completed"] += 1
+    est_data, est_err = _hcp_get("/estimates", params={"page_size": 200})
+    if not est_err and est_data:
+        snap["open_estimates"] = sum(1 for e in est_data.get("estimates", [])
+                                     if e.get("status") not in ("approved", "converted_to_job"))
+    cust_data, cust_err = _hcp_get("/customers", params={"page_size": 200})
+    if not cust_err and cust_data:
+        for c in cust_data.get("customers", []):
+            last_job = c.get("last_job_date")
+            if not last_job:
+                continue
+            try:
+                d = (today - datetime.date.fromisoformat(last_job[:10])).days
+                if d > 60:
+                    snap["lapsed_60"] += 1
+                if d > 90:
+                    snap["lapsed_90"] += 1
+            except (ValueError, TypeError):
+                pass
+    return snap
+
+
+def run_sunday_recommendation(ai_func=None, ai_draft_func=None) -> None:
+    """Sunday evening: ask the AI to pick a focus for the week and draft 3
+    supporting emails. Posts the recommendation + drafts to Carolyn.
+
+    ai_func: callable(system_prompt, user_prompt) -> str. Used to generate the focus narrative.
+    ai_draft_func: same shape used by run_email_drafts.
+    """
+    if _already_sent("sunday_recommendation"):
+        return
+    snap = _build_weekly_snapshot()
+    snap_text = (
+        f"Past 7 days: {snap['completed_jobs']} jobs completed, ~${snap['revenue_estimate']:,.0f} revenue.\n"
+        f"Pipeline today: {snap['open_estimates']} open estimates, {snap['uninvoiced_completed']} uninvoiced completed jobs.\n"
+        f"Lapsed customers: {snap['lapsed_60']} (60+ days), {snap['lapsed_90']} (90+ days)."
+    )
+
+    focus = ""
+    if ai_func:
+        try:
+            system = ("You are the proactive business strategist for Montana Premium House Care. "
+                      "Carolyn is the office manager. Pick ONE focus area for the coming week based "
+                      "on the snapshot — be specific, actionable, and short. Three short paragraphs max. "
+                      "End with a one-line call-to-action Carolyn can do Monday morning. No emojis.")
+            focus = ai_func(system, f"Snapshot:\n{snap_text}\n\nWhat should Carolyn focus on this week, and why?")
+        except Exception as e:
+            focus = f"(AI focus generation failed: {e})"
+
+    intro = (f"*Sunday Planning — Week of {(datetime.date.today() + datetime.timedelta(days=1)).strftime('%B %d')}*\n\n"
+             f"_{snap_text}_\n\n"
+             f"*🎯 Recommended focus this week:*\n{focus or '(no focus generated)'}\n\n"
+             f"I'm drafting 3 supporting emails below — review, add a personal note, and approve.")
+    _post_to_slack(_carolyn_target(), intro)
+
+    # Draft up to 3 supporting emails: prioritize the longest-lapsed customers,
+    # since win-back is almost always the best week-opener.
+    if ai_draft_func:
+        lost = _build_lost_customer_list()
+        for c in lost[:3]:
+            try:
+                draft = ai_draft_func("winback", {
+                    "name": c["name"], "email": c.get("email", ""),
+                    "days_lapsed": c["days_since"], "last_job_date": c["last_job_date"],
+                })
+                body = draft.get("body", "") if isinstance(draft, dict) else str(draft)
+                subject = draft.get("subject") if isinstance(draft, dict) else None
+                _post_draft_for_review(
+                    "win_back", {"name": c["name"], "email": c.get("email", "")},
+                    body, ai_subject=subject,
+                    context_line=f"Sunday-planning draft | {c['days_since']} days inactive",
+                )
+            except Exception as e:
+                print(f"  ⚠️  Sunday draft failed for {c['name']}: {e}")
+
+    _text_carolyn(f"Sunday planning brief is in Slack. {snap['lapsed_60']} lapsed customers, {snap['open_estimates']} open estimates. I drafted 3 emails — review and approve when you're ready.")
+    print("  ✅ Sunday weekly recommendation delivered to Carolyn")
 
 
 # ── Main Scheduler Loop ──────────────────────────────────────────────────────
 
 _scheduler_running = False
 
-def start_proactive_scheduler(ai_draft_func=None):
+def start_proactive_scheduler(ai_draft_func=None, ai_func=None, priority_func=None):
     """
     Start the background scheduler that checks the clock every 60 seconds
     and fires tasks at the right times.
+
+    ai_draft_func: callable(draft_type, customer_data_dict) -> {"subject", "body"}.
+                   Required to generate Monday/Wednesday/Sunday email drafts.
+    ai_func:       callable(system_prompt, user_prompt) -> str.
+                   Required for the Sunday weekly recommendation narrative.
+    priority_func: callable() -> list of priority dicts.
+                   Optional — used to enrich the bundled morning brief.
     """
     global _scheduler_running
     if _scheduler_running:
@@ -428,25 +606,30 @@ def start_proactive_scheduler(ai_draft_func=None):
                 now = datetime.datetime.now()
                 current_time = now.strftime("%H:%M")
                 current_date = now.strftime("%Y-%m-%d")
+                day_name = now.strftime("%A")
 
                 # Reset daily tracker at midnight
                 if current_date != last_date:
                     _reset_daily_tracker()
                     last_date = current_date
 
-                # Morning brief at configured time (default 9:30 AM)
+                # Morning brief at configured time (default 9:30 AM) — bundled with
+                # priorities and any drafted emails.
                 if current_time == MORNING_BRIEF_TIME:
-                    run_morning_brief()
-                    # Also run email drafts (Monday/Wednesday)
-                    run_email_drafts(ai_draft_func=ai_draft_func)
+                    run_bundled_morning_brief(ai_draft_func=ai_draft_func,
+                                              priority_func=priority_func)
 
                 # EOD summary at configured time (default 5:00 PM)
                 if current_time == EOD_SUMMARY_TIME:
                     run_eod_summary()
 
-                # Friday profitability report
-                if now.strftime("%A") == "Friday" and current_time == FRIDAY_REPORT_TIME:
-                    run_email_drafts(ai_draft_func=ai_draft_func)  # Triggers Friday report
+                # Friday profitability report fires through run_email_drafts
+                if day_name == "Friday" and current_time == FRIDAY_REPORT_TIME:
+                    run_email_drafts(ai_draft_func=ai_draft_func)
+
+                # Sunday evening proactive recommendation
+                if day_name == "Sunday" and current_time == SUNDAY_RECO_TIME:
+                    run_sunday_recommendation(ai_func=ai_func, ai_draft_func=ai_draft_func)
 
             except Exception as e:
                 print(f"  ⚠️  Scheduler error: {e}")
@@ -455,7 +638,7 @@ def start_proactive_scheduler(ai_draft_func=None):
 
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
-    print(f"  ⏰ Proactive scheduler started (Brief: {MORNING_BRIEF_TIME}, EOD: {EOD_SUMMARY_TIME})")
+    print(f"  ⏰ Proactive scheduler started (Brief: {MORNING_BRIEF_TIME}, EOD: {EOD_SUMMARY_TIME}, Sunday reco: {SUNDAY_RECO_TIME})")
     return t
 
 

@@ -28,7 +28,14 @@ HCP_API_KEY       = os.getenv("HOUSECALLPRO_API_KEY", "")
 HCP_BASE          = "https://api.housecallpro.com"
 BUSINESS_NAME     = os.getenv("BUSINESS_NAME", "Montana Premium House Care")
 CAROLYN_CHANNEL   = os.getenv("SLACK_CAROLYN_CHANNEL", "#carolyn")
+CAROLYN_SLACK_ID  = os.getenv("CAROLYN_SLACK_ID", "")  # Slack user ID — alerts DM here when set
 ALERTS_CHANNEL    = os.getenv("SLACK_ALERTS_CHANNEL", "#alerts")
+
+
+def _alert_target() -> str:
+    """Where smart alerts should land. DM Carolyn if her user ID is configured,
+    otherwise fall back to the alerts channel."""
+    return CAROLYN_SLACK_ID or ALERTS_CHANNEL
 
 # ── Unified Event Log ────────────────────────────────────────────────────────
 # Every event across all systems gets logged here for the /feed command
@@ -326,7 +333,7 @@ def _post_alert_to_slack(alert: dict):
         requests.post(
             "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}", "Content-Type": "application/json"},
-            json={"channel": CAROLYN_CHANNEL, "blocks": blocks, "text": alert["title"]},
+            json={"channel": _alert_target(), "blocks": blocks, "text": alert["title"]},
             timeout=10,
         )
     except Exception:

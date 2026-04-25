@@ -1509,37 +1509,38 @@ def call_customer_action(ack, body, respond):
 
 @app.action("approve_email")
 def approve_email_action(ack, body, respond):
+    """Carolyn clicked Approve & Send on a draft posted by the proactive scheduler.
+
+    The button value is the queue key set by email_automation.queue_email().
+    We pull the personal note from the input block, hand it to email_automation,
+    and only then is the email actually sent through Mailchimp.
+    """
     ack()
     try:
-        val = json.loads(body["actions"][0]["value"])
-        email_type = val.get("type", "")
-        name = val.get("name", "")
-        email = val.get("email", "")
-        # Extract personal note from the input block
+        key = body["actions"][0]["value"]
+        # Extract personal note from the input block (user may have left it blank).
         personal_note = ""
         state_values = body.get("state", {}).get("values", {})
-        for block_id, block_data in state_values.items():
+        for _block_id, block_data in state_values.items():
             if "personal_note_input" in block_data:
-                personal_note = block_data["personal_note_input"].get("value", "") or ""
+                personal_note = (block_data["personal_note_input"].get("value") or "").strip()
                 break
-        key = f"{email_type}_{name}"
-        if personal_note:
-            queue_email(key, {"type": email_type, "name": name, "email": email, "personal_note": personal_note})
-        success, msg = send_via_mailchimp(key, email)
+        success, msg = ea_approve_email(key, personal_note=personal_note or None)
         if success:
-            respond(f"✅ *Email sent to {name}* ({email})\n\n{f'Personal note added: _{personal_note}_' if personal_note else '_No personal note added_'}\n\n_Sent via Mailchimp_")
+            note_line = f"\n\n_Your personal note woven in:_\n>{personal_note}" if personal_note else "\n\n_(No personal note added.)_"
+            respond(f"✅ *Sent via Mailchimp.* {msg}{note_line}")
         else:
-            respond(f"⚠️ Failed to send: {msg}\n\n_You can try again or send manually from mtpremiumhousecare@gmail.com_")
+            respond(f"⚠️ Could not send: {msg}\n\n_The draft is still in the queue — try again, or send manually from {BUSINESS_EMAIL}._")
     except Exception as e:
-        respond(f"⚠️ Error processing approval: {str(e)}")
+        respond(f"⚠️ Error processing approval: {e}")
 
 @app.action("skip_email")
 def skip_email_action(ack, body, respond):
+    """Carolyn skipped a draft. The button value is the queue key."""
     ack()
-    name = body["actions"][0]["value"]
-    ea_skip_email(f"win_back_{name}")
-    ea_skip_email(f"follow_up_{name}")
-    respond(f"⏭️ Skipped email for {name}.")
+    key = body["actions"][0]["value"]
+    ea_skip_email(key)
+    respond(f"⏭️ Skipped. Draft `{key}` will not be sent.")
 
 @app.action("personal_note_input")
 def personal_note_input_action(ack):
@@ -1726,9 +1727,34 @@ if __name__ == "__main__":
     # Start command center (smart alerts every 10 min, HCP messages every 5 min, EOD at 5pm)
     print("🧠 Starting Command Center (alerts, HCP messages, EOD summary)...")
     start_command_center()
-    # Start proactive scheduler (morning brief at 9:30am, EOD at 5pm, email drafts Mon/Wed/Fri)
-    print("📅 Starting Proactive Scheduler (morning brief 9:30am, emails Mon/Wed/Fri)...")
-    start_proactive_scheduler()
+    # Start proactive scheduler — pass AI hooks so it can draft emails and pick a Sunday focus.
+    # ai_draft_email is the canonical drafter; ai_route_call powers the Sunday narrative.
+    def _scheduler_ai_draft(draft_type, customer_data):
+        return ai_draft_email(draft_type, customer_data)
+    def _scheduler_ai(system_prompt, user_prompt):
+        return ai_route_call("reasoning", system_prompt, user_prompt, temperature=0.6, max_tokens=600)
+    def _scheduler_priorities():
+        # Pull live HCP data so priorities reflect today, not just standing items.
+        hcp_summary = {}
+        jobs_data, err = hcp_get("/jobs", params={"page_size": 100})
+        if not err:
+            all_j = jobs_data.get("jobs", [])
+            hcp_summary["needs_invoice"] = [j for j in all_j if j.get("invoice_status") == "uninvoiced" and j.get("work_status") == "completed"]
+            hcp_summary["cancelled"] = [j for j in all_j if j.get("work_status") == "cancelled"]
+        est_data, est_err = hcp_get("/estimates", params={"page_size": 100})
+        if not est_err:
+            hcp_summary["unconverted_estimates"] = [e for e in est_data.get("estimates", []) if e.get("status") not in ("approved", "converted_to_job")]
+        cust_data, cust_err = hcp_get("/customers", params={"page_size": 100})
+        if not cust_err:
+            today_dt = datetime.date.today()
+            hcp_summary["lapsed_customers"] = [c for c in cust_data.get("customers", []) if c.get("last_job_date") and (today_dt - datetime.date.fromisoformat(c["last_job_date"][:10])).days > 60]
+        return build_priority_list(hcp_summary)
+    print("📅 Starting Proactive Scheduler (bundled morning brief, Mon/Wed drafts, Sun reco, EOD)...")
+    start_proactive_scheduler(
+        ai_draft_func=_scheduler_ai_draft,
+        ai_func=_scheduler_ai,
+        priority_func=_scheduler_priorities,
+    )
     # Start Twilio SMS webhook server (receives incoming texts)
     twilio_status = get_twilio_status()
     if twilio_status["configured"]:
